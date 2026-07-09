@@ -10,40 +10,42 @@ use bdk_core::bitcoin;
 use bdk_core::CheckPoint;
 use bitcoin::BlockHash;
 use bitcoin::{bip158::BlockFilter, Block, ScriptBuf};
-use bitcoincore_rpc;
-use bitcoincore_rpc::{json::GetBlockHeaderResult, RpcApi};
+use corepc_client::client_async;
+use corepc_client::client_async::{
+    GetBlockError, GetBlockFilterError, GetBlockHeaderVerboseError,
+};
 
 /// Type that returns Bitcoin blocks by matching a list of script pubkeys (SPKs) against a
 /// [`bip158::BlockFilter`](bitcoin::bip158::BlockFilter).
 ///
 /// * `FilterIter` talks to bitcoind via JSON-RPC interface, which is handled by the
-///   [`bitcoincore_rpc::Client`].
+///   [`corepc_client::client_async::Client`].
 /// * Collect the script pubkeys (SPKs) you want to watch. These will usually correspond to wallet
 ///   addresses that have been handed out for receiving payments.
 /// * Construct `FilterIter` with the RPC client, SPKs, and [`CheckPoint`]. The checkpoint tip
 ///   informs `FilterIter` of the height to begin scanning from. An error is thrown if `FilterIter`
 ///   is unable to find a common ancestor with the remote node.
-/// * Scan blocks by calling `next` in a loop and processing the [`Event`]s. If a filter matched any
-///   of the watched scripts, then the relevant [`Block`] is returned. Note that false positives may
-///   occur. `FilterIter` will continue to yield events until it reaches the latest chain tip.
-///   Events contain the updated checkpoint `cp` which may be incorporated into the local chain
-///   state to stay in sync with the tip.
+/// * Scan blocks by calling `next_block` in a loop and processing the [`Event`]s. If a filter
+///   matched any of the watched scripts, then the relevant [`Block`] is returned. Note that false
+///   positives may occur. `FilterIter` will continue to yield events until it reaches the latest
+///   chain tip.  Events contain the updated checkpoint `cp` which may be incorporated into the
+///   local chain state to stay in sync with the tip.
 #[derive(Debug)]
 pub struct FilterIter<'a> {
     /// RPC client
-    client: &'a bitcoincore_rpc::Client,
+    client: &'a client_async::Client,
     /// SPK inventory
     spks: Vec<ScriptBuf>,
     /// checkpoint
     cp: CheckPoint<BlockHash>,
     /// Header info, contains the prev and next hashes for each header.
-    header: Option<GetBlockHeaderResult>,
+    header: Option<corepc_client::types::model::GetBlockHeaderVerbose>,
 }
 
 impl<'a> FilterIter<'a> {
     /// Construct [`FilterIter`] with checkpoint, RPC client and SPKs.
     pub fn new(
-        client: &'a bitcoincore_rpc::Client,
+        client: &'a client_async::Client,
         cp: CheckPoint,
         spks: impl IntoIterator<Item = ScriptBuf>,
     ) -> Self {
@@ -58,16 +60,79 @@ impl<'a> FilterIter<'a> {
     /// Return the agreement header with the remote node.
     ///
     /// Error if no agreement header is found.
-    fn find_base(&self) -> Result<GetBlockHeaderResult, Error> {
+    async fn find_base(&self) -> Result<corepc_client::types::model::GetBlockHeaderVerbose, Error> {
         for cp in self.cp.iter() {
-            match self.client.get_block_header_info(&cp.hash()) {
-                Err(e) if is_not_found(&e) => continue,
+            match self
+                .client
+                .get_block_header_verbose(&cp.hash())
+                .await
+            {
+                Err(e) if e.is_not_found_error() => continue,
                 Ok(header) if header.confirmations <= 0 => continue,
                 Ok(header) => return Ok(header),
                 Err(e) => return Err(Error::Rpc(e)),
             }
         }
         Err(Error::ReorgDepthExceeded)
+    }
+
+    /// Produce the next block event from the chain tip.
+    ///
+    /// Returns `Ok(None)` when the chain tip is reached.
+    pub async fn next_block(&mut self) -> Result<Option<Event>, Error> {
+        let mut cp = self.cp.clone();
+
+        let header = match self.header.take() {
+            Some(header) => header,
+            // If no header is cached we need to locate a base of the local
+            // checkpoint from which the scan may proceed.
+            None => self.find_base().await?,
+        };
+
+        let mut next_hash = match header.next_block_hash {
+            Some(hash) => hash,
+            None => return Ok(None),
+        };
+
+        let mut next_header = self
+            .client
+            .get_block_header_verbose(&next_hash)
+            .await?;
+
+        // In case of a reorg, rewind by fetching headers of previous hashes until we find
+        // one with enough confirmations.
+        while next_header.confirmations < 0 {
+            let prev_hash = next_header
+                .previous_block_hash
+                .ok_or(Error::ReorgDepthExceeded)?;
+            let prev_header = self
+                .client
+                .get_block_header_verbose(&prev_hash)
+                .await?;
+            next_header = prev_header;
+        }
+
+        next_hash = next_header.hash;
+        let next_height: u32 = next_header.height;
+
+        cp = cp.insert(next_height, next_hash);
+
+        let mut block = None;
+        let filter_res = self.client.get_block_filter(&next_hash).await?;
+        let filter = BlockFilter::new(filter_res.filter.as_slice());
+        if filter
+            .match_any(&next_hash, self.spks.iter().map(ScriptBuf::as_ref))
+            .map_err(Error::Bip158)?
+        {
+            block = Some(self.client.get_block(&next_hash).await?);
+        }
+
+        // Store the next header
+        self.header = Some(next_header);
+        // Update self.cp
+        self.cp = cp.clone();
+
+        Ok(Some(Event { cp, block }))
     }
 }
 
@@ -92,74 +157,15 @@ impl Event {
     }
 }
 
-impl Iterator for FilterIter<'_> {
-    type Item = Result<Event, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        (|| -> Result<Option<_>, Error> {
-            let mut cp = self.cp.clone();
-
-            let header = match self.header.take() {
-                Some(header) => header,
-                // If no header is cached we need to locate a base of the local
-                // checkpoint from which the scan may proceed.
-                None => self.find_base()?,
-            };
-
-            let mut next_hash = match header.next_block_hash {
-                Some(hash) => hash,
-                None => return Ok(None),
-            };
-
-            let mut next_header = self.client.get_block_header_info(&next_hash)?;
-
-            // In case of a reorg, rewind by fetching headers of previous hashes until we find
-            // one with enough confirmations.
-            while next_header.confirmations < 0 {
-                let prev_hash = next_header
-                    .previous_block_hash
-                    .ok_or(Error::ReorgDepthExceeded)?;
-                let prev_header = self.client.get_block_header_info(&prev_hash)?;
-                next_header = prev_header;
-            }
-
-            next_hash = next_header.hash;
-            let next_height: u32 = next_header.height.try_into()?;
-
-            cp = cp.insert(next_height, next_hash);
-
-            let mut block = None;
-            let filter =
-                BlockFilter::new(self.client.get_block_filter(&next_hash)?.filter.as_slice());
-            if filter
-                .match_any(&next_hash, self.spks.iter().map(ScriptBuf::as_ref))
-                .map_err(Error::Bip158)?
-            {
-                block = Some(self.client.get_block(&next_hash)?);
-            }
-
-            // Store the next header
-            self.header = Some(next_header);
-            // Update self.cp
-            self.cp = cp.clone();
-
-            Ok(Some(Event { cp, block }))
-        })()
-        .transpose()
-    }
-}
-
 /// Error that may be thrown by [`FilterIter`].
 #[derive(Debug)]
 pub enum Error {
     /// RPC error
-    Rpc(bitcoincore_rpc::Error),
+    Rpc(GetBlockHeaderVerboseError),
     /// `bitcoin::bip158` error
     Bip158(bitcoin::bip158::Error),
     /// Max reorg depth exceeded.
     ReorgDepthExceeded,
-    /// Error converting an integer
-    TryFromInt(core::num::TryFromIntError),
 }
 
 impl core::fmt::Display for Error {
@@ -168,30 +174,49 @@ impl core::fmt::Display for Error {
             Self::Rpc(e) => write!(f, "{e}"),
             Self::Bip158(e) => write!(f, "{e}"),
             Self::ReorgDepthExceeded => write!(f, "maximum reorg depth exceeded"),
-            Self::TryFromInt(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl core::error::Error for Error {}
 
-impl From<bitcoincore_rpc::Error> for Error {
-    fn from(e: bitcoincore_rpc::Error) -> Self {
+impl From<GetBlockHeaderVerboseError> for Error {
+    fn from(e: GetBlockHeaderVerboseError) -> Self {
         Self::Rpc(e)
     }
 }
 
-impl From<core::num::TryFromIntError> for Error {
-    fn from(e: core::num::TryFromIntError) -> Self {
-        Self::TryFromInt(e)
+impl From<GetBlockFilterError> for Error {
+    fn from(e: GetBlockFilterError) -> Self {
+        match e {
+            GetBlockFilterError::Rpc(e) => {
+                Error::Rpc(GetBlockHeaderVerboseError::Rpc(e))
+            }
+            GetBlockFilterError::Model(e) => {
+                Error::Rpc(GetBlockHeaderVerboseError::Rpc(
+                    corepc_client::client_async::Error::JsonRpc(
+                        jsonrpc::error::Error::Transport(e.into()),
+                    ),
+                ))
+            }
+        }
     }
 }
 
-/// Whether the RPC error is a "not found" error (code: `-5`).
-fn is_not_found(e: &bitcoincore_rpc::Error) -> bool {
-    matches!(
-        e,
-        bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::Error::Rpc(e))
-        if e.code == -5
-    )
+impl From<GetBlockError> for Error {
+    fn from(e: GetBlockError) -> Self {
+        match e {
+            GetBlockError::Rpc(e) => {
+                Error::Rpc(GetBlockHeaderVerboseError::Rpc(e))
+            }
+            GetBlockError::Model(e) => {
+                Error::Rpc(GetBlockHeaderVerboseError::Rpc(
+                    corepc_client::client_async::Error::JsonRpc(
+                        jsonrpc::error::Error::Transport(e.into()),
+                    ),
+                ))
+            }
+        }
+    }
 }
+

@@ -2,7 +2,7 @@
 //! use the wallet RPC API, so this crate can be used with wallet-disabled Bitcoin Core nodes.
 //!
 //! [`Emitter`] is the main structure which sources blockchain data from
-//! [`bitcoincore_rpc::Client`].
+//! [`corepc_client::client_async::Client`].
 //!
 //! To only get block updates (exclude mempool transactions), the caller can use
 //! [`Emitter::next_block`] until it returns `Ok(None)` (which means the chain tip is reached). A
@@ -18,19 +18,24 @@ use alloc::sync::Arc;
 use bdk_core::collections::{HashMap, HashSet};
 use bdk_core::{BlockId, CheckPoint};
 use bitcoin::{Block, BlockHash, Transaction, Txid};
-use bitcoincore_rpc::{bitcoincore_rpc_json, RpcApi};
-use core::ops::Deref;
+use core::borrow::Borrow;
+use corepc_client::client_async;
+use corepc_client::client_async::{
+    GetBlockCountError, GetBlockError, GetBlockHashError, GetBlockVerboseError,
+    GetRawMempoolError, GetRawTransactionError,
+};
 
 pub mod bip158;
 
-pub use bitcoincore_rpc;
+/// Re-export the `corepc_client` crate for downstream users.
+pub use corepc_client;
 
-/// The [`Emitter`] is used to emit data sourced from [`bitcoincore_rpc::Client`].
+/// The [`Emitter`] is used to emit data sourced from [`corepc_client::client_async::Client`].
 ///
 /// Refer to [module-level documentation] for more.
 ///
 /// [module-level documentation]: crate
-pub struct Emitter<C> {
+pub struct Emitter<C = client_async::Client> {
     client: C,
     start_height: u32,
 
@@ -42,7 +47,7 @@ pub struct Emitter<C> {
     /// next block's block hash (which we use to fetch the next block), we set this to `None`
     /// whenever there are no more blocks, or the next block is no longer in the best chain. This
     /// gives us an opportunity to re-fetch this result.
-    last_block: Option<bitcoincore_rpc_json::GetBlockResult>,
+    last_block: Option<corepc_client::types::model::GetBlockVerboseOne>,
 
     /// The last snapshot of mempool transactions.
     ///
@@ -58,14 +63,13 @@ pub struct Emitter<C> {
 
 /// Indicates that there are no initially-expected mempool transactions.
 ///
-/// Use this as the `expected_mempool_txs` field of [`Emitter::new`] when the wallet is known
+/// Use this as the `expected_mempool_txids` field of [`Emitter::new`] when the wallet is known
 /// to start empty (i.e. with no unconfirmed transactions).
 pub const NO_EXPECTED_MEMPOOL_TXS: core::iter::Empty<Arc<Transaction>> = core::iter::empty();
 
 impl<C> Emitter<C>
 where
-    C: Deref,
-    C::Target: RpcApi,
+    C: Borrow<client_async::Client>,
 {
     /// Construct a new [`Emitter`].
     ///
@@ -138,12 +142,12 @@ where
     /// # Ok::<_, bdk_bitcoind_rpc::bitcoincore_rpc::Error>(())
     /// ```
     #[cfg(feature = "std")]
-    pub fn mempool(&mut self) -> Result<MempoolEvent, bitcoincore_rpc::Error> {
+    pub async fn mempool(&mut self) -> Result<MempoolEvent, Error> {
         let sync_time = std::time::UNIX_EPOCH
             .elapsed()
             .expect("must get current time")
             .as_secs();
-        self.mempool_at(sync_time)
+        self.mempool_at(sync_time).await
     }
 
     /// Emit mempool transactions and any evicted [`Txid`]s at the given `sync_time`.
@@ -151,9 +155,7 @@ where
     /// `sync_time` is in unix seconds.
     ///
     /// This is the no-std version of [`mempool`](Self::mempool).
-    pub fn mempool_at(&mut self, sync_time: u64) -> Result<MempoolEvent, bitcoincore_rpc::Error> {
-        let client = &*self.client;
-
+    pub async fn mempool_at(&mut self, sync_time: u64) -> Result<MempoolEvent, Error> {
         let mut rpc_tip_height;
         let mut rpc_tip_hash;
         let mut rpc_mempool;
@@ -161,36 +163,37 @@ where
 
         // Ensure we get a mempool snapshot consistent with `rpc_tip_hash` as the tip.
         loop {
-            rpc_tip_height = client.get_block_count()?;
-            rpc_tip_hash = client.get_block_hash(rpc_tip_height)?;
-            rpc_mempool = client.get_raw_mempool()?;
+            rpc_tip_height = self.client.borrow().get_block_count().await?;
+            rpc_tip_hash = self.client.borrow().get_block_hash(rpc_tip_height as u32).await?;
+            rpc_mempool = self.client.borrow().get_raw_mempool().await?;
             rpc_mempool_txids = rpc_mempool.iter().copied().collect::<HashSet<Txid>>();
-            let is_still_at_tip = rpc_tip_hash == client.get_block_hash(rpc_tip_height)?
-                && rpc_tip_height == client.get_block_count()?;
+            let is_still_at_tip = rpc_tip_hash
+                == self.client.borrow().get_block_hash(rpc_tip_height as u32).await?
+                && rpc_tip_height == self.client.borrow().get_block_count().await?;
             if is_still_at_tip {
                 break;
             }
         }
 
+        let mut updates = Vec::new();
+        for txid in &rpc_mempool {
+            let tx = match self.mempool_snapshot.get(txid) {
+                Some(tx) => tx.clone(),
+                None => match self.client.borrow().get_raw_transaction(txid).await {
+                    Ok(tx) => {
+                        let tx = Arc::new(tx);
+                        self.mempool_snapshot.insert(*txid, tx.clone());
+                        tx
+                    }
+                    Err(err) if err.is_not_found_error() => continue,
+                    Err(err) => return Err(err.into()),
+                },
+            };
+            updates.push((tx, sync_time));
+        }
+
         let mut mempool_event = MempoolEvent {
-            update: rpc_mempool
-                .into_iter()
-                .filter_map(|txid| -> Option<Result<_, bitcoincore_rpc::Error>> {
-                    let tx = match self.mempool_snapshot.get(&txid) {
-                        Some(tx) => tx.clone(),
-                        None => match client.get_raw_transaction(&txid, None) {
-                            Ok(tx) => {
-                                let tx = Arc::new(tx);
-                                self.mempool_snapshot.insert(txid, tx.clone());
-                                tx
-                            }
-                            Err(err) if err.is_not_found_error() => return None,
-                            Err(err) => return Some(Err(err)),
-                        },
-                    };
-                    Some(Ok((tx, sync_time)))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
+            update: updates,
             ..Default::default()
         };
 
@@ -257,8 +260,8 @@ where
     /// }
     /// # Ok::<_, bdk_bitcoind_rpc::bitcoincore_rpc::Error>(())
     /// ```
-    pub fn next_block(&mut self) -> Result<Option<BlockEvent<Block>>, bitcoincore_rpc::Error> {
-        if let Some((checkpoint, block)) = poll(self, move |hash, client| client.get_block(hash))? {
+    pub async fn next_block(&mut self) -> Result<Option<BlockEvent<Block>>, Error> {
+        if let Some((checkpoint, block)) = poll(self).await? {
             // Stop tracking unconfirmed transactions that have been confirmed in this block.
             for tx in &block.txdata {
                 self.mempool_snapshot.remove(&tx.compute_txid());
@@ -322,40 +325,121 @@ impl<B> BlockEvent<B> {
     }
 }
 
+/// Error type for the RPC operations.
+#[derive(Debug)]
+pub enum Error {
+    /// An RPC call failed.
+    Rpc(client_async::Error),
+    /// A model conversion error occurred (e.g., malformed response from bitcoind).
+    Model(Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::Rpc(e) => write!(f, "RPC error: {}", e),
+            Error::Model(e) => write!(f, "Model error: {}", e),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Rpc(e) => Some(e),
+            Error::Model(e) => Some(&**e),
+        }
+    }
+}
+
+// From impls for per-method error types (only the ones used by Emitter).
+
+impl From<GetBlockCountError> for Error {
+    fn from(e: GetBlockCountError) -> Self {
+        let GetBlockCountError::Rpc(e) = e;
+        Error::Rpc(e)
+    }
+}
+
+impl From<GetBlockHashError> for Error {
+    fn from(e: GetBlockHashError) -> Self {
+        match e {
+            GetBlockHashError::Rpc(e) => Error::Rpc(e),
+            GetBlockHashError::Model(e) => Error::Model(Box::new(e)),
+        }
+    }
+}
+
+impl From<GetRawMempoolError> for Error {
+    fn from(e: GetRawMempoolError) -> Self {
+        match e {
+            GetRawMempoolError::Rpc(e) => Error::Rpc(e),
+            GetRawMempoolError::Model(e) => Error::Model(Box::new(e)),
+        }
+    }
+}
+
+impl From<GetRawTransactionError> for Error {
+    fn from(e: GetRawTransactionError) -> Self {
+        match e {
+            GetRawTransactionError::Rpc(e) => Error::Rpc(e),
+            GetRawTransactionError::Model(e) => Error::Model(e.into()),
+        }
+    }
+}
+
+impl From<GetBlockVerboseError> for Error {
+    fn from(e: GetBlockVerboseError) -> Self {
+        match e {
+            GetBlockVerboseError::Rpc(e) => Error::Rpc(e),
+            GetBlockVerboseError::ModelV31(e) => Error::Model(Box::new(e)),
+            GetBlockVerboseError::ModelV29(e) => Error::Model(Box::new(e)),
+            GetBlockVerboseError::ModelV25(e) => Error::Model(Box::new(e)),
+        }
+    }
+}
+
+impl From<GetBlockError> for Error {
+    fn from(e: GetBlockError) -> Self {
+        match e {
+            GetBlockError::Rpc(e) => Error::Rpc(e),
+            GetBlockError::Model(e) => Error::Model(e.into()),
+        }
+    }
+}
+
 enum PollResponse {
-    Block(bitcoincore_rpc_json::GetBlockResult),
+    Block(corepc_client::types::model::GetBlockVerboseOne),
     NoMoreBlocks,
     /// Fetched block is not in the best chain.
     BlockNotInBestChain,
-    AgreementFound(bitcoincore_rpc_json::GetBlockResult, CheckPoint<BlockHash>),
+    AgreementFound(corepc_client::types::model::GetBlockVerboseOne, CheckPoint<BlockHash>),
     /// Force the genesis checkpoint down the receiver's throat.
     AgreementPointNotFound(BlockHash),
 }
 
-fn poll_once<C>(emitter: &Emitter<C>) -> Result<PollResponse, bitcoincore_rpc::Error>
+async fn poll_once<C>(emitter: &Emitter<C>) -> Result<PollResponse, Error>
 where
-    C: Deref,
-    C::Target: RpcApi,
+    C: Borrow<client_async::Client>,
 {
-    let client = &*emitter.client;
-
     if let Some(last_res) = &emitter.last_block {
-        let next_hash = if last_res.height + 1 < emitter.start_height as _ {
+        let next_hash = if last_res.height + 1 < emitter.start_height {
             // enforce start height
-            let next_hash = client.get_block_hash(emitter.start_height as _)?;
+            let next_hash = emitter.client.borrow().get_block_hash(emitter.start_height).await?;
             // make sure last emission is still in best chain
-            if client.get_block_hash(last_res.height as _)? != last_res.hash {
+            if emitter.client.borrow().get_block_hash(last_res.height).await? != last_res.hash {
                 return Ok(PollResponse::BlockNotInBestChain);
             }
             next_hash
         } else {
-            match last_res.nextblockhash {
+            match last_res.next_block_hash {
                 None => return Ok(PollResponse::NoMoreBlocks),
                 Some(next_hash) => next_hash,
             }
         };
 
-        let res = client.get_block_info(&next_hash)?;
+        let res = emitter.client.borrow().get_block_verbose(&next_hash).await?;
         if res.confirmations < 0 {
             return Ok(PollResponse::BlockNotInBestChain);
         }
@@ -364,7 +448,7 @@ where
     }
 
     for cp in emitter.last_cp.iter() {
-        let res = match client.get_block_info(&cp.hash()) {
+        let res = match emitter.client.borrow().get_block_verbose(&cp.hash()).await {
             // block not in best chain
             Ok(res) if res.confirmations < 0 => continue,
             Ok(res) => res,
@@ -375,32 +459,29 @@ where
                 // if we can't find genesis block, we can't create an update that connects
                 break;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
 
         // agreement point found
         return Ok(PollResponse::AgreementFound(res, cp));
     }
 
-    let genesis_hash = client.get_block_hash(0)?;
+    let genesis_hash = emitter.client.borrow().get_block_hash(0).await?;
     Ok(PollResponse::AgreementPointNotFound(genesis_hash))
 }
 
-fn poll<C, V, F>(
+async fn poll<C>(
     emitter: &mut Emitter<C>,
-    get_item: F,
-) -> Result<Option<(CheckPoint<BlockHash>, V)>, bitcoincore_rpc::Error>
+) -> Result<Option<(CheckPoint<BlockHash>, Block)>, Error>
 where
-    C: Deref,
-    C::Target: RpcApi,
-    F: Fn(&BlockHash, &C::Target) -> Result<V, bitcoincore_rpc::Error>,
+    C: Borrow<client_async::Client>,
 {
     loop {
-        match poll_once(emitter)? {
+        match poll_once(emitter).await? {
             PollResponse::Block(res) => {
-                let height = res.height as u32;
+                let height = res.height;
                 let hash = res.hash;
-                let item = get_item(&hash, &emitter.client)?;
+                let block = emitter.client.borrow().get_block(&hash).await?;
 
                 let new_cp = emitter
                     .last_cp
@@ -409,7 +490,7 @@ where
                     .expect("must push");
                 emitter.last_cp = new_cp.clone();
                 emitter.last_block = Some(res);
-                return Ok(Some((new_cp, item)));
+                return Ok(Some((new_cp, block)));
             }
             PollResponse::NoMoreBlocks => {
                 emitter.last_block = None;
@@ -422,10 +503,8 @@ where
             PollResponse::AgreementFound(res, cp) => {
                 // When a reorg happens, the agreement point drops below `last_cp`. We
                 // override `start_height` so the emitter revisits the invalidated heights.
-                if (res.height as u32) < emitter.start_height
-                    && (res.height as u32) < emitter.last_cp.height()
-                {
-                    emitter.start_height = res.height as _;
+                if res.height < emitter.start_height && res.height < emitter.last_cp.height() {
+                    emitter.start_height = res.height;
                 }
                 // get rid of evicted blocks
                 emitter.last_cp = cp;
@@ -441,26 +520,6 @@ where
     }
 }
 
-/// Extends [`bitcoincore_rpc::Error`].
-pub trait BitcoindRpcErrorExt {
-    /// Returns whether the error is a "not found" error.
-    ///
-    /// This is useful since [`Emitter`] emits [`Result<_, bitcoincore_rpc::Error>`]s as
-    /// [`Iterator::Item`].
-    fn is_not_found_error(&self) -> bool;
-}
-
-impl BitcoindRpcErrorExt for bitcoincore_rpc::Error {
-    fn is_not_found_error(&self) -> bool {
-        if let bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::Error::Rpc(rpc_err)) = self
-        {
-            rpc_err.code == -5
-        } else {
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod test {
@@ -468,23 +527,24 @@ mod test {
     use bdk_chain::local_chain::LocalChain;
     use bdk_testenv::{anyhow, TestEnv};
     use bitcoin::{hashes::Hash, Address, Amount, ScriptBuf, Txid, WScriptHash};
+    use corepc_client::client_async::{Auth, Client};
     use std::collections::HashSet;
 
-    #[test]
-    fn test_expected_mempool_txids_accumulate_and_remove() -> anyhow::Result<()> {
+    #[tokio::test]
+    async fn test_expected_mempool_txids_accumulate_and_remove() -> anyhow::Result<()> {
         let env = TestEnv::new()?;
         let (chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
         let chain_tip = chain.tip();
 
-        let rpc_client = bitcoincore_rpc::Client::new(
+        let rpc_client = Client::new_with_auth(
             &env.bitcoind.rpc_url(),
-            bitcoincore_rpc::Auth::CookieFile(env.bitcoind.params.cookie_file.clone()),
+            Auth::CookieFile(env.bitcoind.params.cookie_file.clone()),
         )?;
 
         let mut emitter = Emitter::new(&rpc_client, chain_tip.clone(), 1, NO_EXPECTED_MEMPOOL_TXS);
 
         env.mine_blocks(100, None)?;
-        while emitter.next_block()?.is_some() {}
+        while emitter.next_block().await?.is_some() {}
 
         let spk_to_track = ScriptBuf::new_p2wsh(&WScriptHash::all_zeros());
         let addr_to_track = Address::from_script(&spk_to_track, bitcoin::Network::Regtest)?;
@@ -494,7 +554,7 @@ mod test {
         for _ in 0..10 {
             let sent_txid = env.send(&addr_to_track, Amount::from_sat(1_000))?;
             mempool_txids.insert(sent_txid);
-            emitter.mempool()?;
+            emitter.mempool().await?;
             env.mine_blocks(1, None)?;
 
             for txid in &mempool_txids {
@@ -507,7 +567,7 @@ mod test {
 
         // Process each block and check that confirmed txids are removed from from
         // expected_mempool_txids.
-        while let Some(block_event) = emitter.next_block()? {
+        while let Some(block_event) = emitter.next_block().await? {
             let confirmed_txids: HashSet<Txid> = block_event
                 .block
                 .txdata

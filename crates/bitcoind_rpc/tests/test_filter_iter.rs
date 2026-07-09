@@ -1,8 +1,7 @@
-use bdk_bitcoind_rpc::bip158::{Error, FilterIter};
+use bdk_bitcoind_rpc::bip158::FilterIter;
 use bdk_core::CheckPoint;
 use bdk_testenv::{anyhow, bitcoind, TestEnv};
 use bitcoin::{Address, Amount, Network, ScriptBuf};
-use bitcoincore_rpc::RpcApi;
 
 use crate::common::ClientExt;
 
@@ -18,15 +17,16 @@ fn testenv() -> anyhow::Result<TestEnv> {
     })
 }
 
-#[test]
-fn filter_iter_matches_blocks() -> anyhow::Result<()> {
+#[tokio::test]
+async fn filter_iter_matches_blocks() -> anyhow::Result<()> {
     let env = testenv()?;
-    let addr = ClientExt::get_rpc_client(&env)?
+    let addr = env.rpc_client()
         .get_new_address(None, None)?
+        .address()?
         .assume_checked();
 
     let _ = env.mine_blocks(100, Some(addr.clone()))?;
-    assert_eq!(ClientExt::get_rpc_client(&env)?.get_block_count()?, 101);
+    assert_eq!(env.rpc_client().get_block_count()?.0, 101);
 
     // Send tx to external address to confirm at height = 102
     let _txid = env.send(
@@ -42,10 +42,9 @@ fn filter_iter_matches_blocks() -> anyhow::Result<()> {
     let cp = CheckPoint::new(0, genesis_hash);
 
     let client = ClientExt::get_rpc_client(&env)?;
-    let iter = FilterIter::new(&client, cp, [addr.script_pubkey()]);
+    let mut iter = FilterIter::new(&client, cp, [addr.script_pubkey()]);
 
-    for res in iter {
-        let event = res?;
+    while let Some(event) = iter.next_block().await? {
         let height = event.height();
         if (2..102).contains(&height) {
             assert!(event.is_match(), "expected to match height {height}");
@@ -57,8 +56,9 @@ fn filter_iter_matches_blocks() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn filter_iter_error_wrong_network() -> anyhow::Result<()> {
+#[tokio::test]
+async fn filter_iter_error_wrong_network() -> anyhow::Result<()> {
+    use bdk_bitcoind_rpc::bip158::Error;
     let env = testenv()?;
     let _ = env.mine_blocks(10, None)?;
 
@@ -66,19 +66,20 @@ fn filter_iter_error_wrong_network() -> anyhow::Result<()> {
     let cp = CheckPoint::new(0, bitcoin::hashes::Hash::hash(b"wrong-hash"));
     let client = ClientExt::get_rpc_client(&env)?;
     let mut iter = FilterIter::new(&client, cp, [ScriptBuf::new()]);
-    assert!(matches!(iter.next(), Some(Err(Error::ReorgDepthExceeded))));
+    let result = iter.next_block().await;
+    assert!(matches!(result, Err(Error::ReorgDepthExceeded)));
 
     Ok(())
 }
 
 // Test that while a reorg is detected we delay incrementing the best height
-#[test]
-fn filter_iter_detects_reorgs() -> anyhow::Result<()> {
+#[tokio::test]
+async fn filter_iter_detects_reorgs() -> anyhow::Result<()> {
     const MINE_TO: u32 = 16;
 
     let env = testenv()?;
     let rpc = ClientExt::get_rpc_client(&env)?;
-    while rpc.get_block_count()? < MINE_TO as u64 {
+    while rpc.get_block_count().await? < MINE_TO as u64 {
         let _ = env.mine_blocks(1, None)?;
     }
 
@@ -91,7 +92,7 @@ fn filter_iter_detects_reorgs() -> anyhow::Result<()> {
 
     // Process events to height (MINE_TO - 1)
     loop {
-        if iter.next().unwrap()?.height() == MINE_TO - 1 {
+        if iter.next_block().await?.expect("should have event").height() == MINE_TO - 1 {
             break;
         }
     }
@@ -101,28 +102,28 @@ fn filter_iter_detects_reorgs() -> anyhow::Result<()> {
         let _ = env.reorg(1)?;
 
         // Call next. If we detect a reorg, we'll see no change in the event height
-        assert_eq!(iter.next().unwrap()?.height(), MINE_TO - 1);
+        assert_eq!(iter.next_block().await?.expect("should have event").height(), MINE_TO - 1);
     }
 
     // If no reorg, then height should increment normally from here on
-    assert_eq!(iter.next().unwrap()?.height(), MINE_TO);
-    assert!(iter.next().is_none());
+    assert_eq!(iter.next_block().await?.expect("should have event").height(), MINE_TO);
+    assert!(iter.next_block().await?.is_none());
 
     // Try 6-block-reorg
     {
         const REORG_COUNT: usize = 6;
         let _ = env.reorg(REORG_COUNT)?;
         for c in (0..REORG_COUNT).rev() {
-            assert_eq!(iter.next().unwrap()?.height(), MINE_TO - (c as u32));
+            assert_eq!(iter.next_block().await?.expect("should have event").height(), MINE_TO - (c as u32));
         }
-        assert!(iter.next().is_none());
+        assert!(iter.next_block().await?.is_none());
     }
 
     Ok(())
 }
 
-#[test]
-fn event_checkpoint_connects_to_local_chain() -> anyhow::Result<()> {
+#[tokio::test]
+async fn event_checkpoint_connects_to_local_chain() -> anyhow::Result<()> {
     use bitcoin::BlockHash;
     use std::collections::BTreeMap;
     let env = testenv()?;
@@ -144,7 +145,7 @@ fn event_checkpoint_connects_to_local_chain() -> anyhow::Result<()> {
     let new_hashes: BTreeMap<u32, BlockHash> = (14..=16).zip(env.reorg(3)?).collect();
 
     // Expect events from height 14 on...
-    while let Some(event) = iter.next().transpose()? {
+    while let Some(event) = iter.next_block().await? {
         let _ = chain
             .apply_update(event.cp)
             .expect("chain update should connect");

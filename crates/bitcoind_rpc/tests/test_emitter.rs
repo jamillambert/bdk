@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, ops::Deref};
+use std::collections::BTreeSet;
 
 use bdk_bitcoind_rpc::{Emitter, NO_EXPECTED_MEMPOOL_TXS};
 use bdk_chain::{
@@ -24,8 +24,8 @@ mod common;
 /// 2. Emit blocks from [`Emitter`] and update the [`LocalChain`].
 /// 3. Reorg highest 6 blocks.
 /// 4. Emit blocks from [`Emitter`] and re-update the [`LocalChain`].
-#[test]
-pub fn test_sync_local_chain() -> anyhow::Result<()> {
+#[tokio::test]
+pub async fn test_sync_local_chain() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
     let network_tip = env.rpc_client().get_block_count()?.into_model().0;
     let (mut local_chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
@@ -46,7 +46,7 @@ pub fn test_sync_local_chain() -> anyhow::Result<()> {
 
     // See if the emitter outputs the right blocks.
 
-    while let Some(emission) = emitter.next_block()? {
+    while let Some(emission) = emitter.next_block().await? {
         let height = emission.block_height();
         let hash = emission.block_hash();
         assert_eq!(
@@ -87,7 +87,7 @@ pub fn test_sync_local_chain() -> anyhow::Result<()> {
     // See if the emitter outputs the right blocks.
 
     let mut exp_height = exp_hashes.len() - reorged_blocks.len();
-    while let Some(emission) = emitter.next_block()? {
+    while let Some(emission) = emitter.next_block().await? {
         let height = emission.block_height();
         let hash = emission.block_hash();
         assert_eq!(
@@ -137,8 +137,8 @@ pub fn test_sync_local_chain() -> anyhow::Result<()> {
 /// block updates.
 ///
 /// [`EmittedUpdate::into_tx_graph_update`]: bdk_bitcoind_rpc::EmittedUpdate::into_tx_graph_update
-#[test]
-fn test_into_tx_graph() -> anyhow::Result<()> {
+#[tokio::test]
+async fn test_into_tx_graph() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
 
     let addr_0 = env
@@ -173,7 +173,7 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
     let client = ClientExt::get_rpc_client(&env)?;
     let emitter = &mut Emitter::new(&client, chain.tip(), 0, NO_EXPECTED_MEMPOOL_TXS);
 
-    while let Some(emission) = emitter.next_block()? {
+    while let Some(emission) = emitter.next_block().await? {
         let height = emission.block_height();
         let _ = chain.apply_update(emission.checkpoint)?;
         let indexed_additions = indexed_tx_graph.apply_block_relevant(&emission.block, height);
@@ -196,9 +196,9 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
     // expect that the next block should be none and we should get 3 txs from mempool
     {
         // next block should be `None`
-        assert!(emitter.next_block()?.is_none());
+        assert!(emitter.next_block().await?.is_none());
 
-        let mempool_txs = emitter.mempool()?;
+        let mempool_txs = emitter.mempool().await?;
         let indexed_additions = indexed_tx_graph.batch_insert_unconfirmed(mempool_txs.update);
         assert_eq!(
             indexed_additions
@@ -232,7 +232,7 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
 
     // must receive mined block which will confirm the transactions.
     {
-        let emission = emitter.next_block()?.expect("must get mined block");
+        let emission = emitter.next_block().await?.expect("must get mined block");
         let height = emission.block_height();
         let _ = chain.apply_update(emission.checkpoint)?;
         let indexed_additions = indexed_tx_graph.apply_block_relevant(&emission.block, height);
@@ -252,8 +252,8 @@ fn test_into_tx_graph() -> anyhow::Result<()> {
 ///
 /// TODO: If the reorg height is lower than the fallback height, how do we find a block height to
 /// emit that can connect with our receiver chain?
-#[test]
-fn ensure_block_emitted_after_reorg_is_at_reorg_height() -> anyhow::Result<()> {
+#[tokio::test]
+async fn ensure_block_emitted_after_reorg_is_at_reorg_height() -> anyhow::Result<()> {
     const EMITTER_START_HEIGHT: usize = 100;
     const CHAIN_TIP_HEIGHT: usize = 110;
 
@@ -268,11 +268,11 @@ fn ensure_block_emitted_after_reorg_is_at_reorg_height() -> anyhow::Result<()> {
     );
 
     env.mine_blocks(CHAIN_TIP_HEIGHT, None)?;
-    while emitter.next_block()?.is_some() {}
+    while emitter.next_block().await?.is_some() {}
 
     for reorg_count in 1..=10 {
         let replaced_blocks = env.reorg_empty_blocks(reorg_count)?;
-        let next_emission = emitter.next_block()?.expect("must emit block after reorg");
+        let next_emission = emitter.next_block().await?.expect("must emit block after reorg");
         assert_eq!(
             (
                 next_emission.block_height() as usize,
@@ -281,7 +281,7 @@ fn ensure_block_emitted_after_reorg_is_at_reorg_height() -> anyhow::Result<()> {
             replaced_blocks[0],
             "block emitted after reorg should be at the reorg height"
         );
-        while emitter.next_block()?.is_some() {}
+        while emitter.next_block().await?.is_some() {}
     }
 
     Ok(())
@@ -298,16 +298,15 @@ fn process_block(
     Ok(())
 }
 
-fn sync_from_emitter<C>(
+async fn sync_from_emitter<C>(
     recv_chain: &mut LocalChain,
     recv_graph: &mut IndexedTxGraph<BlockId, SpkTxOutIndex<()>>,
     emitter: &mut Emitter<C>,
 ) -> anyhow::Result<()>
 where
-    C: Deref,
-    C::Target: bitcoincore_rpc::RpcApi,
+    C: core::borrow::Borrow<corepc_client::client_async::Client>,
 {
-    while let Some(emission) = emitter.next_block()? {
+    while let Some(emission) = emitter.next_block().await? {
         let height = emission.block_height();
         process_block(recv_chain, recv_graph, emission.block, height)?;
     }
@@ -331,8 +330,8 @@ fn get_balance(
 
 /// If a block is reorged out, ensure that containing transactions that do not exist in the
 /// replacement block(s) become unconfirmed.
-#[test]
-fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
+#[tokio::test]
+async fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
     const PREMINE_COUNT: usize = 101;
     const ADDITIONAL_COUNT: usize = 11;
     const SEND_AMOUNT: Amount = Amount::from_sat(10_000);
@@ -390,7 +389,7 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
     }
 
     // get emitter up to tip
-    sync_from_emitter(&mut recv_chain, &mut recv_graph, &mut emitter)?;
+    sync_from_emitter(&mut recv_chain, &mut recv_graph, &mut emitter).await?;
 
     assert_eq!(
         get_balance(&recv_chain, &recv_graph)?,
@@ -404,7 +403,7 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
     // perform reorgs with different depths
     for reorg_count in 1..=ADDITIONAL_COUNT {
         env.reorg_empty_blocks(reorg_count)?;
-        sync_from_emitter(&mut recv_chain, &mut recv_graph, &mut emitter)?;
+        sync_from_emitter(&mut recv_chain, &mut recv_graph, &mut emitter).await?;
 
         assert_eq!(
             get_balance(&recv_chain, &recv_graph)?,
@@ -425,8 +424,8 @@ fn tx_can_become_unconfirmed_after_reorg() -> anyhow::Result<()> {
 /// The receiver (bdk_chain structures) is synced to the chain tip, and there is txs in the mempool.
 /// When we call Emitter::mempool multiple times, mempool txs should not be re-emitted, even if the
 /// chain tip is extended.
-#[test]
-fn mempool_avoids_re_emission() -> anyhow::Result<()> {
+#[tokio::test]
+async fn mempool_avoids_re_emission() -> anyhow::Result<()> {
     const BLOCKS_TO_MINE: usize = 101;
     const MEMPOOL_TX_COUNT: usize = 2;
 
@@ -447,7 +446,7 @@ fn mempool_avoids_re_emission() -> anyhow::Result<()> {
         .address()?
         .assume_checked();
     env.mine_blocks(BLOCKS_TO_MINE, Some(addr.clone()))?;
-    while emitter.next_block()?.is_some() {}
+    while emitter.next_block().await?.is_some() {}
 
     // have some random txs in mempool
     let exp_txids = (0..MEMPOOL_TX_COUNT)
@@ -457,7 +456,7 @@ fn mempool_avoids_re_emission() -> anyhow::Result<()> {
     // First two emissions should include all transactions.
     for _ in 0..2 {
         let emitted_txids = emitter
-            .mempool()?
+            .mempool().await?
             .update
             .into_iter()
             .map(|(tx, _)| tx.compute_txid())
@@ -472,9 +471,9 @@ fn mempool_avoids_re_emission() -> anyhow::Result<()> {
     for _ in 0..BLOCKS_TO_MINE {
         env.mine_empty_block()?;
     }
-    while emitter.next_block()?.is_some() {}
+    while emitter.next_block().await?.is_some() {}
     let emitted_txids = emitter
-        .mempool()?
+        .mempool().await?
         .update
         .into_iter()
         .map(|(tx, _)| tx.compute_txid())
@@ -497,8 +496,8 @@ fn mempool_avoids_re_emission() -> anyhow::Result<()> {
 ///
 /// The block hash of 99b should be different than 99a, but their previous block hashes should
 /// be the same.
-#[test]
-fn no_agreement_point() -> anyhow::Result<()> {
+#[tokio::test]
+async fn no_agreement_point() -> anyhow::Result<()> {
     const PREMINE_COUNT: usize = 101;
 
     let env = TestEnv::new()?;
@@ -516,9 +515,9 @@ fn no_agreement_point() -> anyhow::Result<()> {
     env.mine_blocks(PREMINE_COUNT, None)?;
 
     // emit blocks: 98a, 99a, 100a
-    let block_98a = emitter.next_block()?.expect("block 98a");
-    let block_99a = emitter.next_block()?.expect("block 99a");
-    let block_100a = emitter.next_block()?.expect("block 100a");
+    let block_98a = emitter.next_block().await?.expect("block 98a");
+    let block_99a = emitter.next_block().await?.expect("block 99a");
+    let block_100a = emitter.next_block().await?.expect("block 100a");
     assert_eq!(block_98a.block_height(), 98);
     assert_eq!(block_99a.block_height(), 99);
     assert_eq!(block_100a.block_height(), 100);
@@ -535,7 +534,7 @@ fn no_agreement_point() -> anyhow::Result<()> {
     env.mine_blocks(3, None)?;
 
     // emit block header 99b
-    let block_99b = emitter.next_block()?.expect("block 99b");
+    let block_99b = emitter.next_block().await?.expect("block 99b");
     assert_eq!(block_99b.block_height(), 99);
 
     assert_ne!(block_99a.block_hash(), block_99b.block_hash());
@@ -558,9 +557,8 @@ fn no_agreement_point() -> anyhow::Result<()> {
 /// 1. Broadcast a first tx (tx1) and confirm it arrives in unconfirmed set.
 /// 2. Double-spend tx1 with tx1b and verify `mempool()` reports tx1 as evicted.
 /// 3. Insert the eviction into the graph and assert tx1 is no longer canonical.
-#[test]
-fn test_expect_tx_evicted() -> anyhow::Result<()> {
-    use bdk_bitcoind_rpc::bitcoincore_rpc::bitcoin;
+#[tokio::test]
+async fn test_expect_tx_evicted() -> anyhow::Result<()> {
     use bdk_chain::miniscript;
     use bdk_chain::spk_txout::SpkTxOutIndex;
     use bitcoin::constants::genesis_block;
@@ -591,12 +589,12 @@ fn test_expect_tx_evicted() -> anyhow::Result<()> {
 
     let client = ClientExt::get_rpc_client(&env)?;
     let mut emitter = Emitter::new(&client, chain.tip(), 1, core::iter::once(tx_1));
-    while let Some(emission) = emitter.next_block()? {
+    while let Some(emission) = emitter.next_block().await? {
         let height = emission.block_height();
         chain.apply_header(&emission.block.header, height)?;
     }
 
-    let changeset = graph.batch_insert_unconfirmed(emitter.mempool()?.update);
+    let changeset = graph.batch_insert_unconfirmed(emitter.mempool().await?.update);
     assert!(changeset
         .tx_graph
         .txs
@@ -641,7 +639,7 @@ fn test_expect_tx_evicted() -> anyhow::Result<()> {
     assert_eq!(exp_spk_txids, vec![(spk, txid_1)]);
 
     // Check that mempool emission contains evicted txid.
-    let mempool_event = emitter.mempool()?;
+    let mempool_event = emitter.mempool().await?;
     assert!(mempool_event
         .evicted
         .iter()
@@ -664,8 +662,8 @@ fn test_expect_tx_evicted() -> anyhow::Result<()> {
 /// Creating a new [`Emitter`] after a reorg with `start_height` at the tip should still
 /// produce a connectable checkpoint. When blocks are invalidated, the emitted checkpoint must
 /// include the invalidation height so the update can connect with the original chain.
-#[test]
-fn test_sync_with_new_emitter_after_reorg() -> anyhow::Result<()> {
+#[tokio::test]
+async fn test_sync_with_new_emitter_after_reorg() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
     let (mut local_chain, _) = LocalChain::from_genesis(env.genesis_hash()?);
     let client = ClientExt::get_rpc_client(&env)?;
@@ -673,7 +671,7 @@ fn test_sync_with_new_emitter_after_reorg() -> anyhow::Result<()> {
     env.mine_blocks(110, None)?;
 
     let mut emitter = Emitter::new(&client, local_chain.tip(), 0, NO_EXPECTED_MEMPOOL_TXS);
-    while let Some(emission) = emitter.next_block()? {
+    while let Some(emission) = emitter.next_block().await? {
         let _ = local_chain.apply_update(emission.checkpoint)?;
     }
 
@@ -690,7 +688,7 @@ fn test_sync_with_new_emitter_after_reorg() -> anyhow::Result<()> {
         NO_EXPECTED_MEMPOOL_TXS,
     );
 
-    while let Some(emission) = emitter.next_block()? {
+    while let Some(emission) = emitter.next_block().await? {
         let _ = local_chain
             .apply_update(emission.checkpoint)
             .expect("emission checkpoint must connect with local chain");
@@ -702,8 +700,8 @@ fn test_sync_with_new_emitter_after_reorg() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn detect_new_mempool_txs() -> anyhow::Result<()> {
+#[tokio::test]
+async fn detect_new_mempool_txs() -> anyhow::Result<()> {
     let env = TestEnv::new()?;
     env.mine_blocks(101, None)?;
 
@@ -721,11 +719,11 @@ fn detect_new_mempool_txs() -> anyhow::Result<()> {
         NO_EXPECTED_MEMPOOL_TXS,
     );
 
-    while emitter.next_block()?.is_some() {}
+    while emitter.next_block().await?.is_some() {}
 
     for n in 0..5 {
         let txid = env.send(&addr, Amount::ONE_BTC)?;
-        let new_txs = emitter.mempool()?.update;
+        let new_txs = emitter.mempool().await?.update;
         assert!(
             new_txs.iter().any(|(tx, _)| tx.compute_txid() == txid),
             "must detect new tx {n}"

@@ -8,6 +8,7 @@ use bdk_chain::indexer::keychain_txout::KeychainTxOutIndex;
 use bdk_chain::local_chain::LocalChain;
 use bdk_chain::miniscript::Descriptor;
 use bdk_chain::{ConfirmationBlockTime, IndexedTxGraph, SpkIterator};
+use corepc_client::client_async::{Auth, Client};
 use bdk_testenv::anyhow;
 
 // This example shows how BDK chain and tx-graph structures are updated using compact
@@ -24,7 +25,8 @@ const NETWORK: Network = Network::Signet;
 const START_HEIGHT: u32 = 205_000;
 const START_HASH: &str = "0000002bd0f82f8c0c0f1e19128f84c938763641dba85c44bdb6aed1678d16cb";
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     // Setup receiving chain and graph structures.
     let secp = Secp256k1::new();
     let (descriptor, _) = Descriptor::parse_descriptor(&secp, EXTERNAL)?;
@@ -44,20 +46,19 @@ fn main() -> anyhow::Result<()> {
     // Configure RPC client
     let url = std::env::var("RPC_URL").context("must set RPC_URL")?;
     let cookie = std::env::var("RPC_COOKIE").context("must set RPC_COOKIE")?;
-    let rpc_client =
-        bitcoincore_rpc::Client::new(&url, bitcoincore_rpc::Auth::CookieFile(cookie.into()))?;
+    let rpc_client = Client::new_with_auth(&url, Auth::CookieFile(cookie.into()))?;
 
     // Initialize `FilterIter`
     let mut spks = vec![];
     for (_, desc) in graph.index.keychains() {
         spks.extend(SpkIterator::new_with_range(desc, 0..SPK_COUNT).map(|(_, s)| s));
     }
-    let iter = FilterIter::new(&rpc_client, chain.tip(), spks);
+    let mut iter = FilterIter::new(&rpc_client, chain.tip(), spks);
 
     let start = Instant::now();
 
-    for res in iter {
-        let Event { cp, block } = res?;
+    while let Some(event) = iter.next_block().await? {
+        let Event { cp, block } = event;
         let height = cp.height();
         let _ = chain.apply_update(cp)?;
         if let Some(block) = block {

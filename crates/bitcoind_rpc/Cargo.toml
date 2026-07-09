@@ -17,13 +17,16 @@ workspace = true
 
 [dependencies]
 bitcoin = { version = "0.32.0", default-features = false }
-bitcoincore-rpc = { version = "0.19.0" }
 bdk_core = { path = "../core", version = "0.6.1", default-features = false }
+
+corepc-client = { path = "/home/jlambert/git/corepc.worktrees/corepc/client", features = ["client-async"] }
+jsonrpc = { path = "/home/jlambert/git/corepc.worktrees/corepc/jsonrpc", default-features = false }
 
 [dev-dependencies]
 bdk_bitcoind_rpc = { path = "." }
 bdk_testenv = { path = "../testenv" }
 bdk_chain = { path = "../chain" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 
 [features]
 default = ["std"]
